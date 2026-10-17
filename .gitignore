@@ -5,3 +5,4 @@ __pycache__/
 logistics.db
 receipts/*.jpg
 receipts/*.png
+.adk/
