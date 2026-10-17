@@ -163,4 +163,54 @@ docs/superpowers/    design spec + implementation plan
 
 ## Measured latency
 
-(end-to-end demo time will be filled before submission)
+End-to-end (combined warehouse + freight booking, from prompt to verified
+summary): **~21 s** on the Gemini free tier with `gemini-3.8-flash`
+(4 LLM turns + 6 MCP tool calls + verifier). Under the 30 s demo budget.
+Note: the Gemini free tier allows 5 requests/minute per model; rapid
+consecutive runs may hit a brief 429 — wait ~1 min and retry.
+
+## Sample request / response
+
+**Request (typed into `adk web`):**
+
+```
+Allocate pallet storage in a warehouse near Sriperumbudur AND book freight
+for 4 pallets from Chennai Port to that warehouse. Verify the booking when done.
+```
+
+**What happens (event trace from the ADK dev UI):**
+
+```
+logistics_coordinator: transfer_to_agent(warehouse_agent)
+warehouse_agent:      search_warehouse(min_pallets=4)
+warehouse_agent:      allocate_space(warehouse_id=W1, pallets=4, order_ref=ORD-4)
+warehouse_agent:      transfer_to_agent(logistics_coordinator)
+logistics_coordinator: transfer_to_agent(freight_agent)
+freight_agent:        search_freight(min_capacity_kg=1000)
+freight_agent:        book_shipment(truck_id=T3, origin="Chennai Port",
+                                   destination="Sriperumbudur Hub", pallets=4)
+freight_agent:        transfer_to_agent(logistics_coordinator)
+logistics_coordinator: transfer_to_agent(verifier_agent)
+verifier_agent:       verify_booking(shipment_id=2) -> {"status": "OK", "violations": []}
+```
+
+**Response (final summary in the chat):**
+
+```
+VERIFIED
+
+Shipment Summary:
+- Shipment ID: 2
+- Truck ID: T3
+- Origin: Chennai Port
+- Destination: Sriperumbudur Hub
+- Weight (kg): 1000.0
+- Distance (km): 30
+- Cost: 3900.0
+- Warehouse: W1, 4 pallets allocated under order ORD-4
+- Verification: PASS, no violations
+```
+
+Every booking gets an independent `verify_booking` pass; on violations the
+coordinator triggers rollback (`cancel_shipment`) and re-booking, recording
+the recovery in `self_heal_log`.
