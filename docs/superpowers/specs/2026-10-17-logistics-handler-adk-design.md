@@ -24,6 +24,20 @@ Build an agentic system that automates a logistics workflow end-to-end. Scope ch
 - SQLite (`logistics.db`) as the fake-data store
 - SQLite MCP server exposed to agents via ADK `McpToolset`
 - `adk web` dev UI as the demo interface (no custom frontend)
+- `config.py` — single module holding every hardcoded/configuration value (see §3.1)
+
+### 3.1 Configuration (`config.py`)
+
+All hardcoded and tunable values live in one `config.py`; no magic strings or numbers elsewhere. Values come from `os.environ` with defaults defined in `config.py`, so `.env` overrides anything without code changes.
+
+| Group | Contents |
+|---|---|
+| Model | `MODEL_NAME` (default `"gemini-2.0-flash"`), `GOOGLE_API_KEY` (env only) |
+| Paths | `DB_PATH` (`logistics.db`), `RECEIPTS_DIR` (`receipts/`), seed data location |
+| Self-heal | `MAX_RETRIES` (2), `RETRY_DELAY_S`, verifier trigger toggle |
+| Latency | `MAX_E2E_SECONDS` (30), per-turn duration log toggle |
+| Data limits | pallet/truck capacity bounds used by tools and seed script |
+| Prompt constants | agent names, instruction fragments kept out of agent files where reused |
 
 ## 4. Architecture
 
@@ -102,7 +116,7 @@ User uploads a receipt/loading-challan photo → saved to `receipts/` → `recei
 
 ## 11. Build Order (thin slices)
 
-1. Project scaffold + seed DB → verify: pytest seed test green
+1. Project scaffold + `config.py` + seed DB → verify: pytest seed test green
 2. Freight agent + tools → verify: books a shipment via pytest
 3. Warehouse agent + tools → verify: allocates pallets via pytest
 4. Root + hierarchy wiring → verify: demo prompt 1 works in `adk web`
