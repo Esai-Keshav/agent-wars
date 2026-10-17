@@ -1,0 +1,5 @@
+google-adk[mcp]
+python-dotenv
+sqlalchemy>=2.0
+pytest
+pillow
