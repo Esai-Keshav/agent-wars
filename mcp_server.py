@@ -130,6 +130,99 @@ def cancel_shipment(shipment_id: int) -> dict:
     return cancel_shipment_impl(shipment_id)
 
 
+def search_warehouse_impl(min_pallets: int, db_path: str = "") -> dict:
+    try:
+        with db.get_session(db_path) as s:
+            free = db.Warehouse.capacity_pallets - db.Warehouse.used_pallets
+            rows = (
+                s.query(db.Warehouse)
+                .filter(free >= min_pallets)
+                .order_by(free.desc())
+                .all()
+            )
+            payload = [
+                {"id": w.id, "name": w.name, "area_chennai": w.area_chennai,
+                 "free_pallets": w.capacity_pallets - w.used_pallets}
+                for w in rows
+            ]
+        return {"status": "OK", "warehouses": payload}
+    except OperationalError as exc:
+        if "locked" in str(exc) and _DB_LOCK_RETRIES:
+            time.sleep(config.RETRY_DELAY_S)
+            return search_warehouse_impl(min_pallets, db_path)
+        return _err("db_error", str(exc))
+
+
+def allocate_space_impl(
+    warehouse_id: str, pallets: int, order_ref: str, db_path: str = ""
+) -> dict:
+    try:
+        with db.get_session(db_path) as s:
+            wh = s.get(db.Warehouse, warehouse_id)
+            if wh is None:
+                return _err("not_found", f"warehouse {warehouse_id}")
+            if pallets > wh.capacity_pallets - wh.used_pallets:
+                return _err(
+                    "capacity_exceeded",
+                    f"need {pallets} pallets, {warehouse_id} has"
+                    f" {wh.capacity_pallets - wh.used_pallets} free",
+                )
+            allocation = db.Allocation(
+                warehouse_id=warehouse_id, pallets=pallets, order_ref=order_ref
+            )
+            s.add(allocation)
+            wh.used_pallets += pallets
+            s.commit()
+            allocation_id = allocation.id
+            area = wh.area_chennai
+        return {
+            "status": "OK", "allocation_id": allocation_id,
+            "warehouse_id": warehouse_id, "pallets": pallets,
+            "order_ref": order_ref, "area": area,
+        }
+    except OperationalError as exc:
+        if "locked" in str(exc) and _DB_LOCK_RETRIES:
+            time.sleep(config.RETRY_DELAY_S)
+            return allocate_space_impl(warehouse_id, pallets, order_ref, db_path)
+        return _err("db_error", str(exc))
+
+
+def log_self_heal_impl(
+    agent: str, error_reason: str, remediation: str, outcome: str, db_path: str = ""
+) -> dict:
+    try:
+        with db.get_session(db_path) as s:
+            s.add(db.SelfHealLog(
+                agent=agent, error_reason=error_reason,
+                remediation=remediation, outcome=outcome,
+            ))
+            s.commit()
+        return {"status": "OK"}
+    except OperationalError as exc:
+        if "locked" in str(exc) and _DB_LOCK_RETRIES:
+            time.sleep(config.RETRY_DELAY_S)
+            return log_self_heal_impl(agent, error_reason, remediation, outcome, db_path)
+        return _err("db_error", str(exc))
+
+
+@mcp.tool()
+def search_warehouse(min_pallets: int) -> dict:
+    """Find fake Chennai warehouses with at least this many free pallet slots."""
+    return search_warehouse_impl(min_pallets)
+
+
+@mcp.tool()
+def allocate_space(warehouse_id: str, pallets: int, order_ref: str) -> dict:
+    """Reserve pallet space in a warehouse for an order."""
+    return allocate_space_impl(warehouse_id, pallets, order_ref)
+
+
+@mcp.tool()
+def log_self_heal(agent: str, error_reason: str, remediation: str, outcome: str) -> dict:
+    """Record an auto-remediated failure so the final answer can report resilience."""
+    return log_self_heal_impl(agent, error_reason, remediation, outcome)
+
+
 if __name__ == "__main__":
     seed.seed(config.DB_PATH)
     mcp.run()
