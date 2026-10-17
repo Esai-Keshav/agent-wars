@@ -20,7 +20,7 @@ Build an agentic system that automates a logistics workflow end-to-end. Scope ch
 ## 3. Stack
 
 - Python 3.10+, `google-adk`
-- Gemini via Google AI Studio (`GOOGLE_API_KEY`), built-in `google_search` tool
+- Gemini 2.0 Flash via Google AI Studio (`GOOGLE_API_KEY`), built-in `google_search` tool
 - SQLite (`logistics.db`) as the fake-data store
 - SQLite MCP server exposed to agents via ADK `McpToolset`
 - `adk web` dev UI as the demo interface (no custom frontend)
@@ -40,7 +40,7 @@ All DB access flows through the SQLite MCP server. All persistence tools are MCP
 | Agent | Type | Role | Tools |
 |---|---|---|---|
 | `root` | LlmAgent | Understands the request, routes to specialists, assembles the final answer, folds in live web-search context | `google_search`; transfers to sub-agents |
-| `freight_agent` | LlmAgent | Finds trucks/routes (Chennai Port, Avadi, Sriperumbudur corridors), quotes rates, books shipments | MCP: `search_freight`, `book_shipment` |
+| `freight_agent` | LlmAgent | Finds trucks/routes (Chennai Port, Avadi, Sriperumbudur corridors), quotes rates, books shipments, cancels on re-book | MCP: `search_freight`, `book_shipment`, `cancel_shipment` |
 | `warehouse_agent` | LlmAgent | Allocates storage space at Chennai warehouses, checks pallet availability | MCP: `search_warehouse`, `allocate_space` |
 | `verifier_agent` | LlmAgent | Re-reads the DB after every booking; detects capacity conflicts, double bookings, negative stock; flags violations to root | MCP: `verify_booking` |
 | (tool, not agent) | — | Reads uploaded receipt/loading-challan images via Gemini Vision, extracts sender/weight/pallet count as structured JSON | `receipt_reader` |
@@ -71,7 +71,7 @@ Remediation ladder, max 2 retries per failure:
 | Error | Remediation |
 |---|---|
 | `capacity_exceeded` | Re-search alternative truck/warehouse, retry |
-| `double_book` (caught by verifier) | Rollback via `cancel_shipment`, re-book |
+| `double_book` (caught by verifier) | Verifier flags root; root delegates to freight_agent: rollback via `cancel_shipment`, then re-book |
 | `db_locked` / timeout | Retry once after short delay |
 | unknown | Escalate to root; root reports the failure honestly to the user |
 
