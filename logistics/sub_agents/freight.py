@@ -44,6 +44,9 @@ freight_agent = LlmAgent(
         f" You MUST retry at most {config.MAX_RETRIES} times, then escalate."
         " For photo challans, the user gives an image path; call read_receipt_impl(path),"
         " then proceed with the extracted pallets/weight/destination as a normal booking."
+        " When your work is complete, transfer back to logistics_coordinator"
+        " with a one-line report (booking ids, cost, or ERROR reason); do not"
+        " converse with the user directly."
     ),
     tools=[freight_toolset, read_receipt_impl],
 )

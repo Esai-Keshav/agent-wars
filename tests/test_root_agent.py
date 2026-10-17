@@ -14,8 +14,8 @@ def test_sub_agents_wired():
 
 
 def test_root_includes_search_tool():
-    from google.adk.tools import google_search
-    assert google_search in logistics.root_agent.tools
+    from google.adk.tools.google_search_tool import GoogleSearchTool
+    assert any(isinstance(t, GoogleSearchTool) for t in logistics.root_agent.tools)
 
 
 def test_root_instruction_routes():

@@ -24,6 +24,62 @@ flowchart TD
     GV --> F
 ```
 
+## Architecture
+
+```mermaid
+flowchart TD
+    U[User prompt] --> R[logistics_coordinator root]
+    R -->|1. route: booking?| F[freight_agent]
+    R -->|1. route: storage?| Wh[warehouse_agent]
+    F -->|2. MCP tool call| MCP[mcp_server.py - MCPServer stdio]
+    Wh -->|2. MCP tool call| MCP
+    MCP -->|3. SQLAlchemy ORM| DB[(SQLite logistics.db)]
+    MCP -->|structured result| F
+    MCP -->|structured result| Wh
+    F -->|4. report booking| R
+    Wh -->|4. report booking| R
+    R -->|5. verify shipment_id| V[verifier_agent - verify_booking]
+    V -->|OK / violations| R
+    R -->|6. ERROR? retry loop max 2| MCP
+    R -->|self-heal| HL[(self_heal_log table)]
+    R -->|7. summary: cost + verified + recoveries| U
+    R -.->|market-rate questions| WS[google_search - Gemini grounding]
+    U -.->|challan image path| RR[receipt_reader_impl - Gemini Vision]
+    RR -->|pallets, weight, destination| R
+```</think><tool_call>edit<arg_key>newString</arg_key><arg_value>### Request flow (one booking, numbered in order)
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant R as logistics_coordinator
+    participant F as freight_agent
+    participant Wh as warehouse_agent
+    participant M as mcp_server.py (MCP stdio)
+    participant DB as SQLite (SQLAlchemy)
+    participant V as verifier_agent
+    participant S as google_search
+
+    U->>R: "Book 4 pallets, Port -> Sriperumbudur"
+    R->>Wh: route: allocate storage
+    Wh->>M: search_warehouse / allocate_space
+    M->>DB: query / insert (ORM)
+    M-->>Wh: structured result
+    Wh-->>R: allocation confirmed
+    R->>F: route: book freight
+    F->>M: search_freight / book_shipment
+    M->>DB: insert shipment, flip truck flag
+    M-->>F: cost, shipment_id
+    F-->>R: booking payload
+    R->>V: verify_booking(shipment_id)
+    V->>M: verify_booking
+    M->>DB: consistency checks
+    M-->>V: OK / violations
+    V-->>R: VERIFIED or violations -> rollback + re-book
+    R->>R: on ERROR: retry ladder (max 2), log_self_heal
+    R->>S: only if user asks market rates
+    R-->>U: summary: ids, order, cost, VERIFIED, recoveries
+```
+
 - **root (`logistics_coordinator`)** — routes requests, owns `google_search`,
   assembles the final answer with cost + verification + self-heal count.
 - **freight_agent** — searches trucks, books/cancels shipments (MCP tools).

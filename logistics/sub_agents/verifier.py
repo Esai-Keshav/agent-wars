@@ -41,6 +41,7 @@ verifier_agent = LlmAgent(
         " If reason is not_found, re-check the id once; you may retry at most"
         f" {config.MAX_RETRIES} times, then escalate with status ERROR."
         " Never raise or fabricate results; only report tool outputs."
+        " When done, transfer back to logistics_coordinator with your verdict."
     ),
     tools=[verifier_toolset],
 )

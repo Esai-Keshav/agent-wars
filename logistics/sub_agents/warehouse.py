@@ -42,6 +42,9 @@ warehouse_agent = LlmAgent(
         " 5) If retries are exhausted, reply with status ERROR and the original reason."
         " Never raise or fabricate results; only report tool outputs."
         f" You MUST retry at most {config.MAX_RETRIES} times, then escalate."
+        " When your work is complete, transfer back to logistics_coordinator"
+        " with a one-line report (warehouse id, pallets allocated, or ERROR"
+        " reason); do not converse with the user directly."
     ),
     tools=[warehouse_toolset],
 )
