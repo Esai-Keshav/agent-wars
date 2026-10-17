@@ -237,11 +237,6 @@ def verify_booking_impl(shipment_id: int, db_path: str = "") -> dict:
             truck = s.get(db.Truck, ship.truck_id)
             if truck is None:
                 violations.append(f"missing_truck:{ship.truck_id}")
-            elif truck.available:
-                violations.append(
-                    f"truck_flag:truck {ship.truck_id} marked available"
-                    " for a BOOKED shipment"
-                )
             else:
                 booked = (
                     s.query(db.Shipment)
@@ -254,6 +249,11 @@ def verify_booking_impl(shipment_id: int, db_path: str = "") -> dict:
                     violations.append(
                         f"double_book:truck {ship.truck_id} has"
                         f" {booked} other BOOKED shipments"
+                    )
+                if truck.available:
+                    violations.append(
+                        f"truck_flag:truck {ship.truck_id} marked available"
+                        " for a BOOKED shipment"
                     )
             if violations:
                 return {
