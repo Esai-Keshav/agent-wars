@@ -21,7 +21,7 @@ Build an agentic system that automates a logistics workflow end-to-end. Scope ch
 
 - Python 3.10+, `google-adk`
 - Gemini 2.0 Flash via Google AI Studio (`GOOGLE_API_KEY`), built-in `google_search` tool
-- SQLite (`logistics.db`) as the fake-data store
+- SQLAlchemy 2.0 (`logistics.db`) as the fake-data store, models in `db.py`, seeded by `seed.py`
 - SQLite MCP server exposed to agents via ADK `McpToolset`
 - `adk web` dev UI as the demo interface (no custom frontend)
 - `config.py` — single module holding every hardcoded/configuration value (see §3.1)

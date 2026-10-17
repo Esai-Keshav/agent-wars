@@ -4,9 +4,9 @@
 
 **Goal:** Multi-agent ADK system that books freight and allocates Chennai warehouse space from chat, with SQLite via a custom MCP server, self-healing retries, and multimodal challan reading.
 
-**Architecture:** Root `LlmAgent` routes to three specialist `LlmAgent`s (freight, warehouse, verifier). All DB persistence goes through a custom FastMCP server (`mcp_server.py`) launched over stdio via ADK `McpToolset`. Root also holds ADK's built-in `google_search` tool. A `receipt_reader` function tool uses Gemini Vision.
+**Architecture:** Root `LlmAgent` routes to three specialist `LlmAgent`s (freight, warehouse, verifier). All DB persistence goes through a custom FastMCP server (`mcp_server.py`) launched over stdio via ADK `McpToolset`, backed by SQLAlchemy ORM models (`db.py`, SQLite) seeded by `seed.py`. Root also holds ADK's built-in `google_search` tool. A `receipt_reader` function tool uses Gemini Vision.
 
-**Tech Stack:** Python 3.10+, `google-adk[mcp]`, `mcp` (FastMCP, ships with ADK), `python-dotenv`, Gemini 2.0 Flash via AI Studio, `pytest`.
+**Tech Stack:** Python 3.10+, `uv` (venv + deps), `google-adk[mcp]`, `mcp` (FastMCP, ships with ADK), SQLAlchemy 2.0 ORM (SQLite), `python-dotenv`, Gemini 2.0 Flash via AI Studio, `pytest`.
 
 **Spec:** `docs/superpowers/specs/2026-10-17-logistics-handler-adk-design.md`
 
@@ -15,7 +15,8 @@
 - All hardcoded/configuration values live in `config.py` (spec §3.1); no magic numbers/strings elsewhere.
 - Tools never raise raw exceptions; they return `{"status": "ERROR", "reason": ..., "detail": ...}` on failure (spec §6).
 - Retry ladder: max 2 retries per failure, then escalate to root which reports honestly (spec §6).
-- All DB access flows through the MCP server (spec §4); agents hold no direct SQLite imports.
+- All DB access flows through the MCP server (spec §4); agents hold no direct DB imports.
+- Persistence is SQLAlchemy 2.0 ORM only (`db.py` models + `get_session`); no raw SQL strings anywhere; seed data loads only via `seed.py` (`python seed.py` or `seed.seed(db_path)`), idempotent.
 - Model name only from `config.MODEL_NAME` (default `gemini-2.0-flash`).
 - ADK API shapes locked from official docs: `McpToolset(connection_params=StdioConnectionParams(server_params=StdioServerParameters(...), timeout=5), tool_filter=[...])` from `google.adk.tools.mcp_tool` / `google.adk.tools.mcp_tool.mcp_session_manager`.
 - ADK web package layout: agent package `logistics/` with `agent.py` exposing `root_agent`, `__init__.py` re-exporting it; `adk web` runs from repo root.
@@ -23,11 +24,12 @@
 
 ---
 
-### Task 1: Scaffold, config.py, SQLite schema + seed, tests
+### Task 1: Scaffold, config.py, SQLAlchemy models + seed.py, tests
 
 **Files:**
 - Create: `config.py`
-- Create: `db.py`
+- Create: `db.py` (SQLAlchemy ORM models + engine/session helpers)
+- Create: `seed.py` (idempotent data loader, CLI)
 - Create: `requirements.txt`
 - Create: `.env.example`
 - Create: `.gitignore`
@@ -35,17 +37,17 @@
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `config.py` constants `MODEL_NAME`, `DB_PATH`, `RECEIPTS_DIR`, `MAX_RETRIES`, `RETRY_DELAY_S`, `MAX_E2E_SECONDS`, `CORRIDOR_KM` (dict of origin→destination km), `SEED_TRUCKS`, `SEED_WAREHOUSES`; `db.init_db(db_path: str)`, `db.seed(db_path: str)`, `db.get_conn(db_path: str) -> sqlite3.Connection` (row_factory=sqlite3.Row)
+- Produces: `config.py` constants `MODEL_NAME`, `DB_PATH`, `RECEIPTS_DIR`, `MAX_RETRIES`, `RETRY_DELAY_S`, `MAX_E2E_SECONDS`, `CORRIDOR_KM` (dict of origin→destination km), `DEFAULT_CORRIDOR_KM`, `SEED_TRUCKS`, `SEED_WAREHOUSES`, `PALLET_WEIGHT_KG`; `db.Base` (DeclarativeBase) with models `db.Truck`, `db.Shipment`, `db.Warehouse`, `db.Allocation`, `db.Receipt`, `db.SelfHealLog`; `db.init_db(db_path: str = "")`, `db.get_engine(db_path: str = "")`, `db.get_session(db_path: str = "") -> Session` (SQLAlchemy 2.0; caller commits and uses `with db.get_session(p) as s:`); `seed.seed(db_path: str = "") -> dict` returning `{"status": "OK", "trucks": int, "warehouses": int}`; CLI `python seed.py [--db PATH]`
 
-- [ ] **Step 1: Create venv + install deps first (plan-level env step, verify with import)**
+- [ ] **Step 1: Create uv venv + install deps first (plan-level env step, verify with import)**
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -q "google-adk[mcp]" python-dotenv pytest
-.venv/bin/python -c "import google.adk, mcp, dotenv; print('ok')"
+uv venv .venv
+uv pip install -r requirements.txt
+uv run python -c "import google.adk, mcp, dotenv, sqlalchemy; print('ok')"
 ```
 
-Expected: prints `ok`. If pip times out, retry; record total install time for README.
+Expected: prints `ok`. If install is slow, retry; record total install time for README. Requires `uv` on PATH (`pip install uv` or https://docs.astral.sh/uv/).
 
 - [ ] **Step 2: Write config.py**
 
@@ -96,6 +98,9 @@ SEED_WAREHOUSES = [
     {"id": "W3", "name": "Ambattur Warehouse", "area_chennai": "Ambattur",      "capacity_pallets": 60,  "used_pallets": 55},
     {"id": "W4", "name": "Guindy Cold-Chain",  "area_chennai": "Guindy",        "capacity_pallets": 150, "used_pallets": 10},
 ]
+
+# Booking assumptions
+PALLET_WEIGHT_KG = 250
 ```
 
 - [ ] **Step 3: Write requirements.txt, .env.example, .gitignore**
@@ -104,7 +109,9 @@ SEED_WAREHOUSES = [
 ```
 google-adk[mcp]
 python-dotenv
+sqlalchemy>=2.0
 pytest
+pillow
 ```
 
 `.env.example`:
@@ -129,136 +136,180 @@ receipts/*.png
 - [ ] **Step 4: Write failing test tests/test_db.py**
 
 ```python
-import os
-import sqlite3
+import sqlalchemy
 
 import db
+import seed
 
 
 def make_db(tmp_path):
     path = str(tmp_path / "logistics.db")
     db.init_db(path)
-    db.seed(path)
+    seed.seed(path)
     return path
 
 
 def test_seed_trucks_and_warehouses(tmp_path):
     path = make_db(tmp_path)
-    conn = db.get_conn(path)
-    trucks = conn.execute("SELECT * FROM trucks").fetchall()
-    whs = conn.execute("SELECT * FROM warehouses").fetchall()
-    conn.close()
-    assert len(trucks) == 4
-    assert len(whs) == 4
-    assert trucks[0]["id"] == "T1"
-    assert all(t["available"] for t in trucks)
+    with db.get_session(path) as s:
+        assert s.query(db.Truck).count() == 4
+        assert s.query(db.Warehouse).count() == 4
+        assert s.get(db.Truck, "T1").type == "LCV"
+        assert all(t.available for t in s.query(db.Truck).all())
 
 
-def test_init_db_idempotent(tmp_path):
+def test_seed_idempotent(tmp_path):
     path = make_db(tmp_path)
-    db.init_db(path)  # second call must not raise
-    db.seed(path)     # must not duplicate rows
-    path2 = path
-    conn = db.get_conn(path2)
-    assert conn.execute("SELECT COUNT(*) c FROM trucks").fetchone()["c"] == 4
-    conn.close()
+    seed.seed(path)  # second call must not duplicate rows
+    with db.get_session(path) as s:
+        assert s.query(db.Truck).count() == 4
+        assert s.query(db.Warehouse).count() == 4
 
 
-def test_tables_exist(tmp_path):
+def test_all_tables_created(tmp_path):
     path = make_db(tmp_path)
-    conn = db.get_conn(path)
-    tables = {
-        r["name"]
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-    }
-    conn.close()
-    assert {"trucks", "shipments", "warehouses", "allocations", "receipts", "self_heal_log"} <= tables
+    names = set(sqlalchemy.inspect(db.get_engine(path)).get_table_names())
+    assert {"trucks", "shipments", "warehouses", "allocations", "receipts",
+            "self_heal_log"} <= names
 ```
 
 - [ ] **Step 5: Run test, expect failure**
 
-Run: `.venv/bin/pytest tests/test_db.py -q`
+Run: `uv run pytest tests/test_db.py -q`
 Expected: FAIL (`No module named 'db'`)
 
-- [ ] **Step 6: Write db.py**
+- [ ] **Step 6: Write db.py (SQLAlchemy ORM)**
 
 ```python
-"""SQLite schema, seeding, and connection helper for logistics.db."""
-import sqlite3
+"""SQLAlchemy ORM models + session helpers for logistics.db (spec 5)."""
+from sqlalchemy import (Boolean, DateTime, Float, Integer, String, create_engine,
+                        func)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 import config
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS trucks (
-    id TEXT PRIMARY KEY, type TEXT, capacity_kg REAL,
-    rate_per_km REAL, available INTEGER
-);
-CREATE TABLE IF NOT EXISTS shipments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, truck_id TEXT REFERENCES trucks(id),
-    origin TEXT, destination TEXT, status TEXT, cost REAL
-);
-CREATE TABLE IF NOT EXISTS warehouses (
-    id TEXT PRIMARY KEY, name TEXT, area_chennai TEXT,
-    capacity_pallets INTEGER, used_pallets INTEGER
-);
-CREATE TABLE IF NOT EXISTS allocations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    warehouse_id TEXT REFERENCES warehouses(id),
-    pallets INTEGER, order_ref TEXT
-);
-CREATE TABLE IF NOT EXISTS receipts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, image_path TEXT, shipment_id INTEGER
-);
-CREATE TABLE IF NOT EXISTS self_heal_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT, error_reason TEXT,
-    remediation TEXT, outcome TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-"""
+
+class Base(DeclarativeBase):
+    pass
 
 
-def get_conn(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+class Truck(Base):
+    __tablename__ = "trucks"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    type: Mapped[str] = mapped_column(String)
+    capacity_kg: Mapped[float] = mapped_column(Float)
+    rate_per_km: Mapped[float] = mapped_column(Float)
+    available: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
-def init_db(db_path: str) -> None:
-    conn = get_conn(db_path)
-    conn.executescript(SCHEMA)
-    conn.commit()
-    conn.close()
+class Shipment(Base):
+    __tablename__ = "shipments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    truck_id: Mapped[str] = mapped_column(String)
+    origin: Mapped[str] = mapped_column(String)
+    destination: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String)
+    cost: Mapped[float] = mapped_column(Float)
 
 
-def seed(db_path: str) -> None:
-    conn = get_conn(db_path)
-    if conn.execute("SELECT COUNT(*) c FROM trucks").fetchone()["c"] == 0:
-        conn.executemany(
-            "INSERT INTO trucks (id, type, capacity_kg, rate_per_km, available)"
-            " VALUES (:id, :type, :capacity_kg, :rate_per_km, :available)",
-            [dict(t, available=1) for t in config.SEED_TRUCKS],
-        )
-    if conn.execute("SELECT COUNT(*) c FROM warehouses").fetchone()["c"] == 0:
-        conn.executemany(
-            "INSERT INTO warehouses (id, name, area_chennai, capacity_pallets, used_pallets)"
-            " VALUES (:id, :name, :area_chennai, :capacity_pallets, :used_pallets)",
-            config.SEED_WAREHOUSES,
-        )
-    conn.commit()
-    conn.close()
+class Warehouse(Base):
+    __tablename__ = "warehouses"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    area_chennai: Mapped[str] = mapped_column(String)
+    capacity_pallets: Mapped[int] = mapped_column(Integer)
+    used_pallets: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Allocation(Base):
+    __tablename__ = "allocations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    warehouse_id: Mapped[str] = mapped_column(String)
+    pallets: Mapped[int] = mapped_column(Integer)
+    order_ref: Mapped[str] = mapped_column(String)
+
+
+class Receipt(Base):
+    __tablename__ = "receipts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    image_path: Mapped[str] = mapped_column(String)
+    shipment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class SelfHealLog(Base):
+    __tablename__ = "self_heal_log"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    agent: Mapped[str] = mapped_column(String)
+    error_reason: Mapped[str] = mapped_column(String)
+    remediation: Mapped[str] = mapped_column(String)
+    outcome: Mapped[str] = mapped_column(String)
+    ts: Mapped[object] = mapped_column(DateTime, server_default=func.now())
+
+
+_ENGINES = {}
+
+
+def get_engine(db_path: str = ""):
+    path = db_path or config.DB_PATH
+    if path not in _ENGINES:
+        _ENGINES[path] = create_engine(f"sqlite:///{path}", future=True)
+    return _ENGINES[path]
+
+
+def init_db(db_path: str = "") -> None:
+    Base.metadata.create_all(get_engine(db_path))
+
+
+def get_session(db_path: str = "") -> Session:
+    return Session(bind=get_engine(db_path), future=True)
 ```
 
-- [ ] **Step 7: Run test, expect pass**
+Callers use `with db.get_session(p) as s:` and call `s.commit()` explicitly before exit (Session closes on with-exit).
 
-Run: `.venv/bin/pytest tests/test_db.py -q`
+- [ ] **Step 7: Write seed.py (idempotent loader)**
+
+```python
+"""Load fake Chennai logistics data into the DB. Idempotent (spec 5)."""
+import argparse
+
+import config
+import db
+
+
+def seed(db_path: str = "") -> dict:
+    db.init_db(db_path)
+    with db.get_session(db_path) as s:
+        trucks_added = 0
+        if s.query(db.Truck).count() == 0:
+            for t in config.SEED_TRUCKS:
+                s.add(db.Truck(**t))
+            trucks_added = len(config.SEED_TRUCKS)
+        whs_added = 0
+        if s.query(db.Warehouse).count() == 0:
+            for w in config.SEED_WAREHOUSES:
+                s.add(db.Warehouse(**w))
+            whs_added = len(config.SEED_WAREHOUSES)
+        s.commit()
+    return {"status": "OK", "trucks": trucks_added, "warehouses": whs_added}
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Load fake Chennai logistics data")
+    ap.add_argument("--db", default=config.DB_PATH, help="path to logistics.db")
+    args = ap.parse_args()
+    print(seed(args.db))
+```
+
+- [ ] **Step 8: Run test, expect pass**
+
+Run: `uv run pytest tests/test_db.py -q`
 Expected: 3 passed
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add config.py db.py requirements.txt .env.example .gitignore tests/test_db.py
-git commit -m "feat: scaffold, config, sqlite schema and chennai seed data"
+git add config.py db.py seed.py requirements.txt .env.example .gitignore tests/test_db.py
+git commit -m "feat: scaffold, sqlalchemy models, chennai seed loader"
 ```
 
 ---
@@ -270,27 +321,21 @@ git commit -m "feat: scaffold, config, sqlite schema and chennai seed data"
 - Test: `tests/test_freight_tools.py`
 
 **Interfaces:**
-- Consumes: `db`, `config` from Task 1
-- Produces: FastMCP instance `mcp` with tools `search_freight(min_capacity_kg: float) -> dict`, `book_shipment(truck_id: str, origin: str, destination: str, pallets: float) -> dict`, `cancel_shipment(shipment_id: int) -> dict`. Success shape `{"status": "OK", ...payload}`; error shape `{"status": "ERROR", "reason": str, "detail": str}`. Tools internally call plain functions `search_freight_impl`, `book_shipment_impl`, `cancel_shipment_impl` (same signatures) so tests hit functions without spawning MCP. Also `PALLET_WEIGHT_KG = 250` in config.
+- Consumes: `db` (ORM models, `get_session`), `seed`, `config` from Task 1
+- Produces: FastMCP instance `mcp` with tools `search_freight(min_capacity_kg: float) -> dict`, `book_shipment(truck_id: str, origin: str, destination: str, pallets: float) -> dict`, `cancel_shipment(shipment_id: int) -> dict`. Success shape `{"status": "OK", ...payload}`; error shape `{"status": "ERROR", "reason": str, "detail": str}`. Tools internally call plain functions `search_freight_impl(..., db_path: str = "")`, `book_shipment_impl(..., db_path: str = "")`, `cancel_shipment_impl(shipment_id: int, db_path: str = "")` (same key signatures) so tests hit functions without spawning MCP. Module constants: `mcp_server._DB_LOCK_RETRIES = 1`, helper `mcp_server._err(reason, detail)`, `mcp_server.corridor_km(origin, destination) -> int`.
 
-- [ ] **Step 1: Add pallet weight to config.py (append)**
-
-```python
-# Booking assumptions
-PALLET_WEIGHT_KG = 250
-```
-
-- [ ] **Step 2: Write failing test tests/test_freight_tools.py**
+- [ ] **Step 1: Write failing test tests/test_freight_tools.py**
 
 ```python
 import db
 import mcp_server
+import seed
 
 
 def seeded(tmp_path):
     path = str(tmp_path / "logi.db")
     db.init_db(path)
-    db.seed(path)
+    seed.seed(path)
     return path
 
 
@@ -305,10 +350,9 @@ def test_search_freight_filters_capacity(tmp_path):
 
 def test_search_freight_excludes_unavailable(tmp_path):
     path = seeded(tmp_path)
-    conn = db.get_conn(path)
-    conn.execute("UPDATE trucks SET available=0 WHERE id='T1'")
-    conn.commit()
-    conn.close()
+    with db.get_session(path) as s:
+        s.get(db.Truck, "T1").available = False
+        s.commit()
     res = mcp_server.search_freight_impl(min_capacity_kg=3400, db_path=path)
     assert "T1" not in [t["id"] for t in res["trucks"]]
 
@@ -321,11 +365,8 @@ def test_book_shipment_success(tmp_path):
     )
     assert res["status"] == "OK"
     assert res["cost"] == 120 * 12  # rate_per_km * CORRIDOR_KM["Chennai Port"]["Guindy"]
-    conn = db.get_conn(path)
-    assert conn.execute(
-        "SELECT available FROM trucks WHERE id='T1'"
-    ).fetchone()["available"] == 0
-    conn.close()
+    with db.get_session(path) as s:
+        assert s.get(db.Truck, "T1").available is False
 
 
 def test_book_shipment_over_weight_is_capacity_error(tmp_path):
@@ -349,10 +390,9 @@ def test_book_shipment_unknown_truck(tmp_path):
 
 def test_book_shipment_unavailable_truck(tmp_path):
     path = seeded(tmp_path)
-    conn = db.get_conn(path)
-    conn.execute("UPDATE trucks SET available=0 WHERE id='T2'")
-    conn.commit()
-    conn.close()
+    with db.get_session(path) as s:
+        s.get(db.Truck, "T2").available = False
+        s.commit()
     res = mcp_server.book_shipment_impl(
         truck_id="T2", origin="Chennai Port", destination="Sriperumbudur",
         pallets=4, db_path=path,
@@ -369,14 +409,9 @@ def test_cancel_shipment_restores_availability(tmp_path):
     )
     res = mcp_server.cancel_shipment_impl(shipment_id=booking["shipment_id"], db_path=path)
     assert res["status"] == "OK"
-    conn = db.get_conn(path)
-    assert conn.execute(
-        "SELECT available FROM trucks WHERE id='T1'"
-    ).fetchone()["available"] == 1
-    assert conn.execute(
-        "SELECT status FROM shipments WHERE id=?", (booking["shipment_id"],)
-    ).fetchone()["status"] == "CANCELLED"
-    conn.close()
+    with db.get_session(path) as s:
+        assert s.get(db.Truck, "T1").available is True
+        assert s.get(db.Shipment, booking["shipment_id"]).status == "CANCELLED"
 
 
 def test_corridor_fallback_distance(tmp_path):
@@ -388,27 +423,27 @@ def test_corridor_fallback_distance(tmp_path):
     assert res["cost"] == 120 * 33  # CORRIDOR_KM["Guindy"]["Sriperumbudur"]
 ```
 
-- [ ] **Step 3: Run test, expect failure**
+- [ ] **Step 2: Run test, expect failure**
 
-Run: `.venv/bin/pytest tests/test_freight_tools.py -q`
+Run: `uv run pytest tests/test_freight_tools.py -q`
 Expected: FAIL (`No module named 'mcp_server'`)
 
-- [ ] **Step 4: Write mcp_server.py (freight tools only this task)**
+- [ ] **Step 3: Write mcp_server.py (freight tools only this task)**
 
 ```python
-"""Custom MCP server exposing logistics SQLite operations to ADK agents (spec 4).
+"""Custom MCP server exposing logistics ORM operations to ADK agents (spec 4).
 
 Every tool never raises raw exceptions (spec 6): it returns a structured dict.
 Launch over stdio: python mcp_server.py
 """
-import sqlite3
-import sys
 import time
 
 from mcp.server.fastmcp import FastMCP
+from sqlalchemy.exc import OperationalError
 
 import config
 import db
+import seed
 
 mcp = FastMCP("logistics")
 
@@ -419,21 +454,20 @@ def _err(reason: str, detail: str) -> dict:
     return {"status": "ERROR", "reason": reason, "detail": detail}
 
 
-def _conn(db_path: str) -> sqlite3.Connection:
-    return db.get_conn(db_path or config.DB_PATH)
-
-
 def search_freight_impl(min_capacity_kg: float, db_path: str = "") -> dict:
     try:
-        conn = _conn(db_path)
-        rows = conn.execute(
-            "SELECT id, type, capacity_kg, rate_per_km FROM trucks"
-            " WHERE available=1 AND capacity_kg >= ? ORDER BY rate_per_km",
-            (min_capacity_kg,),
-        ).fetchall()
-        conn.close()
-        return {"status": "OK", "trucks": [dict(r) for r in rows]}
-    except sqlite3.OperationalError as exc:
+        with db.get_session(db_path) as s:
+            trucks = (
+                s.query(db.Truck)
+                .filter(db.Truck.available.is_(True),
+                        db.Truck.capacity_kg >= min_capacity_kg)
+                .order_by(db.Truck.rate_per_km)
+                .all()
+            )
+            payload = [{"id": t.id, "type": t.type, "capacity_kg": t.capacity_kg,
+                        "rate_per_km": t.rate_per_km} for t in trucks]
+        return {"status": "OK", "trucks": payload}
+    except OperationalError as exc:
         if "locked" in str(exc) and _DB_LOCK_RETRIES:
             time.sleep(config.RETRY_DELAY_S)
             return search_freight_impl(min_capacity_kg, db_path)
@@ -452,38 +486,31 @@ def book_shipment_impl(
     weight = pallets * config.PALLET_WEIGHT_KG
     km = corridor_km(origin, destination)
     try:
-        conn = _conn(db_path)
-        truck = conn.execute(
-            "SELECT * FROM trucks WHERE id=?", (truck_id,)
-        ).fetchone()
-        if truck is None:
-            conn.close()
-            return _err("not_found", f"truck {truck_id}")
-        if not truck["available"]:
-            conn.close()
-            return _err("truck_unavailable", f"truck {truck_id} not available")
-        if weight > truck["capacity_kg"]:
-            conn.close()
-            return _err(
-                "capacity_exceeded",
-                f"need {weight}kg, truck {truck_id} holds {truck['capacity_kg']}kg",
-            )
-        cost = km * truck["rate_per_km"]
-        cur = conn.execute(
-            "INSERT INTO shipments (truck_id, origin, destination, status, cost)"
-            " VALUES (?, ?, ?, 'BOOKED', ?)",
-            (truck_id, origin, destination, cost),
-        )
-        conn.execute("UPDATE trucks SET available=0 WHERE id=?", (truck_id,))
-        conn.commit()
-        shipment_id = cur.lastrowid
-        conn.close()
+        with db.get_session(db_path) as s:
+            truck = s.get(db.Truck, truck_id)
+            if truck is None:
+                return _err("not_found", f"truck {truck_id}")
+            if not truck.available:
+                return _err("truck_unavailable", f"truck {truck_id} not available")
+            if weight > truck.capacity_kg:
+                return _err(
+                    "capacity_exceeded",
+                    f"need {weight}kg, truck {truck_id} holds {truck.capacity_kg}kg",
+                )
+            shipment = db.Shipment(truck_id=truck_id, origin=origin,
+                                   destination=destination, status="BOOKED",
+                                   cost=km * truck.rate_per_km)
+            s.add(shipment)
+            truck.available = False
+            s.commit()
+            shipment_id = shipment.id
+            cost = shipment.cost
         return {
             "status": "OK", "shipment_id": shipment_id, "truck_id": truck_id,
             "origin": origin, "destination": destination, "weight_kg": weight,
             "distance_km": km, "cost": cost,
         }
-    except sqlite3.OperationalError as exc:
+    except OperationalError as exc:
         if "locked" in str(exc) and _DB_LOCK_RETRIES:
             time.sleep(config.RETRY_DELAY_S)
             return book_shipment_impl(truck_id, origin, destination, pallets, db_path)
@@ -492,25 +519,26 @@ def book_shipment_impl(
 
 def cancel_shipment_impl(shipment_id: int, db_path: str = "") -> dict:
     try:
-        conn = _conn(db_path)
-        ship = conn.execute(
-            "SELECT * FROM shipments WHERE id=?", (shipment_id,)
-        ).fetchone()
-        if ship is None:
-            conn.close()
-            return _err("not_found", f"shipment {shipment_id}")
-        conn.execute(
-            "UPDATE shipments SET status='CANCELLED' WHERE id=?", (shipment_id,)
-        )
-        conn.execute(
-            "UPDATE trucks SET available=1 WHERE id=? AND NOT EXISTS ("
-            "SELECT 1 FROM shipments WHERE truck_id=? AND status='BOOKED')",
-            (ship["truck_id"], ship["truck_id"]),
-        )
-        conn.commit()
-        conn.close()
-        return {"status": "OK", "shipment_id": shipment_id, "truck_id": ship["truck_id"]}
-    except sqlite3.OperationalError as exc:
+        with db.get_session(db_path) as s:
+            ship = s.get(db.Shipment, shipment_id)
+            if ship is None:
+                return _err("not_found", f"shipment {shipment_id}")
+            truck_id_bak = ship.truck_id
+            ship.status = "CANCELLED"
+            other_booked = (
+                s.query(db.Shipment)
+                .filter(db.Shipment.truck_id == ship.truck_id,
+                        db.Shipment.status == "BOOKED",
+                        db.Shipment.id != shipment_id)
+                .count()
+            )
+            if other_booked == 0:
+                truck = s.get(db.Truck, truck_id_bak)
+                if truck is not None:
+                    truck.available = True
+            s.commit()
+        return {"status": "OK", "shipment_id": shipment_id, "truck_id": truck_id_bak}
+    except OperationalError as exc:
         if "locked" in str(exc) and _DB_LOCK_RETRIES:
             time.sleep(config.RETRY_DELAY_S)
             return cancel_shipment_impl(shipment_id, db_path)
@@ -536,20 +564,21 @@ def cancel_shipment(shipment_id: int) -> dict:
 
 
 if __name__ == "__main__":
-    db.init_db(config.DB_PATH)
-    db.seed(config.DB_PATH)
+    seed.seed(config.DB_PATH)
     mcp.run()
 ```
 
-- [ ] **Step 5: Run test, expect pass**
+Note on early returns inside `with db.get_session(...)`: those return paths only read or made no partial writes that need rollback; SQLAlchemy rolls back uncommitted changes on session close.
 
-Run: `.venv/bin/pytest tests/test_freight_tools.py -q`
+- [ ] **Step 4: Run test, expect pass**
+
+Run: `uv run pytest tests/test_freight_tools.py -q`
 Expected: 8 passed
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add mcp_server.py tests/test_freight_tools.py config.py
+git add mcp_server.py tests/test_freight_tools.py
 git commit -m "feat: mcp freight tools with structured errors and retry"
 ```
 
@@ -562,7 +591,7 @@ git commit -m "feat: mcp freight tools with structured errors and retry"
 - Test: `tests/test_warehouse_tools.py`
 
 **Interfaces:**
-- Consumes: Task 1 `db`, Task 2 `mcp/_err/_conn` helpers
+- Consumes: Task 1 `db` ORM models + `get_session`, Task 2 `mcp_server._err/_DB_LOCK_RETRIES`
 - Produces: `search_warehouse_impl(min_pallets: int, db_path: str = "") -> dict`, `allocate_space_impl(warehouse_id: str, pallets: int, order_ref: str, db_path: str = "") -> dict` (ALSO `search_warehouse`, `allocate_space`, `log_self_heal` MCP tools), `log_self_heal_impl(agent: str, error_reason: str, remediation: str, outcome: str, db_path: str = "") -> dict`
 
 - [ ] **Step 1: Write failing test tests/test_warehouse_tools.py**
@@ -570,12 +599,13 @@ git commit -m "feat: mcp freight tools with structured errors and retry"
 ```python
 import db
 import mcp_server
+import seed
 
 
 def seeded(tmp_path):
     path = str(tmp_path / "logi.db")
     db.init_db(path)
-    db.seed(path)
+    seed.seed(path)
     return path
 
 
@@ -594,11 +624,8 @@ def test_allocate_space_success(tmp_path):
         warehouse_id="W1", pallets=10, order_ref="ORD-1", db_path=path
     )
     assert res["status"] == "OK"
-    conn = db.get_conn(path)
-    assert conn.execute(
-        "SELECT used_pallets FROM warehouses WHERE id='W1'"
-    ).fetchone()["used_pallets"] == 50
-    conn.close()
+    with db.get_session(path) as s:
+        assert s.get(db.Warehouse, "W1").used_pallets == 50
 
 
 def test_allocate_space_capacity_error(tmp_path):
@@ -625,16 +652,15 @@ def test_log_self_heal(tmp_path):
         remediation="re-booked on T2", outcome="SUCCESS", db_path=path,
     )
     assert res["status"] == "OK"
-    conn = db.get_conn(path)
-    row = conn.execute("SELECT * FROM self_heal_log").fetchone()
-    assert row["agent"] == "freight_agent"
-    assert row["error_reason"] == "capacity_exceeded"
-    conn.close()
+    with db.get_session(path) as s:
+        row = s.query(db.SelfHealLog).one()
+        assert row.agent == "freight_agent"
+        assert row.error_reason == "capacity_exceeded"
 ```
 
 - [ ] **Step 2: Run test, expect failure**
 
-Run: `.venv/bin/pytest tests/test_warehouse_tools.py -q`
+Run: `uv run pytest tests/test_warehouse_tools.py -q`
 Expected: FAIL (attributes missing)
 
 - [ ] **Step 3: Add impls + MCP tools to mcp_server.py (before `if __name__ == "__main__":`)**
@@ -642,15 +668,21 @@ Expected: FAIL (attributes missing)
 ```python
 def search_warehouse_impl(min_pallets: int, db_path: str = "") -> dict:
     try:
-        conn = _conn(db_path)
-        rows = conn.execute(
-            "SELECT id, name, area_chennai, capacity_pallets - used_pallets AS free_pallets"
-            " FROM warehouses WHERE capacity_pallets - used_pallets >= ? ORDER BY free_pallets DESC",
-            (min_pallets,),
-        ).fetchall()
-        conn.close()
-        return {"status": "OK", "warehouses": [dict(r) for r in rows]}
-    except sqlite3.OperationalError as exc:
+        with db.get_session(db_path) as s:
+            free = db.Warehouse.capacity_pallets - db.Warehouse.used_pallets
+            rows = (
+                s.query(db.Warehouse)
+                .filter(free >= min_pallets)
+                .order_by(free.desc())
+                .all()
+            )
+            payload = [
+                {"id": w.id, "name": w.name, "area_chennai": w.area_chennai,
+                 "free_pallets": w.capacity_pallets - w.used_pallets}
+                for w in rows
+            ]
+        return {"status": "OK", "warehouses": payload}
+    except OperationalError as exc:
         if "locked" in str(exc) and _DB_LOCK_RETRIES:
             time.sleep(config.RETRY_DELAY_S)
             return search_warehouse_impl(min_pallets, db_path)
@@ -661,37 +693,30 @@ def allocate_space_impl(
     warehouse_id: str, pallets: int, order_ref: str, db_path: str = ""
 ) -> dict:
     try:
-        conn = _conn(db_path)
-        wh = conn.execute(
-            "SELECT * FROM warehouses WHERE id=?", (warehouse_id,)
-        ).fetchone()
-        if wh is None:
-            conn.close()
-            return _err("not_found", f"warehouse {warehouse_id}")
-        free = wh["capacity_pallets"] - wh["used_pallets"]
-        if pallets > free:
-            conn.close()
-            return _err(
-                "capacity_exceeded",
-                f"need {pallets} pallets, {warehouse_id} has {free} free",
+        with db.get_session(db_path) as s:
+            wh = s.get(db.Warehouse, warehouse_id)
+            if wh is None:
+                return _err("not_found", f"warehouse {warehouse_id}")
+            if pallets > wh.capacity_pallets - wh.used_pallets:
+                return _err(
+                    "capacity_exceeded",
+                    f"need {pallets} pallets, {warehouse_id} has"
+                    f" {wh.capacity_pallets - wh.used_pallets} free",
+                )
+            allocation = db.Allocation(
+                warehouse_id=warehouse_id, pallets=pallets, order_ref=order_ref
             )
-        cur = conn.execute(
-            "INSERT INTO allocations (warehouse_id, pallets, order_ref) VALUES (?,?,?)",
-            (warehouse_id, pallets, order_ref),
-        )
-        conn.execute(
-            "UPDATE warehouses SET used_pallets = used_pallets + ? WHERE id=?",
-            (pallets, warehouse_id),
-        )
-        conn.commit()
-        allocation_id = cur.lastrowid
-        conn.close()
+            s.add(allocation)
+            wh.used_pallets += pallets
+            s.commit()
+            allocation_id = allocation.id
+            area = wh.area_chennai
         return {
             "status": "OK", "allocation_id": allocation_id,
             "warehouse_id": warehouse_id, "pallets": pallets,
-            "order_ref": order_ref, "area": wh["area_chennai"],
+            "order_ref": order_ref, "area": area,
         }
-    except sqlite3.OperationalError as exc:
+    except OperationalError as exc:
         if "locked" in str(exc) and _DB_LOCK_RETRIES:
             time.sleep(config.RETRY_DELAY_S)
             return allocate_space_impl(warehouse_id, pallets, order_ref, db_path)
@@ -702,16 +727,14 @@ def log_self_heal_impl(
     agent: str, error_reason: str, remediation: str, outcome: str, db_path: str = ""
 ) -> dict:
     try:
-        conn = _conn(db_path)
-        conn.execute(
-            "INSERT INTO self_heal_log (agent, error_reason, remediation, outcome)"
-            " VALUES (?,?,?,?)",
-            (agent, error_reason, remediation, outcome),
-        )
-        conn.commit()
-        conn.close()
+        with db.get_session(db_path) as s:
+            s.add(db.SelfHealLog(
+                agent=agent, error_reason=error_reason,
+                remediation=remediation, outcome=outcome,
+            ))
+            s.commit()
         return {"status": "OK"}
-    except sqlite3.OperationalError as exc:
+    except OperationalError as exc:
         if "locked" in str(exc) and _DB_LOCK_RETRIES:
             time.sleep(config.RETRY_DELAY_S)
             return log_self_heal_impl(agent, error_reason, remediation, outcome, db_path)
@@ -738,7 +761,7 @@ def log_self_heal(agent: str, error_reason: str, remediation: str, outcome: str)
 
 - [ ] **Step 4: Run all tests, expect pass**
 
-Run: `.venv/bin/pytest tests/ -q`
+Run: `uv run pytest tests/ -q`
 Expected: all green (3 db + 8 freight + 5 warehouse)
 
 - [ ] **Step 5: Commit**
@@ -757,7 +780,7 @@ git commit -m "feat: mcp warehouse tools and self-heal log"
 - Create: `tests/test_verify.py`
 
 **Interfaces:**
-- Consumes: Tasks 1-3 db/mcp helpers
+- Consumes: Tasks 1-3: `db` ORM models (`Shipment`, `Truck`), `db.get_session`, Task 2 `mcp_server._err/_DB_LOCK_RETRIES`
 - Produces: `verify_booking_impl(shipment_id: int, db_path: str = "") -> dict` and MCP tool `verify_booking`. Success shape `{"status": "OK", "violations": []}`, problem shape `{"status": "ERROR", "reason": "verifier_violations", "violations": [str, ...]}` / `{"reason": "not_found", ...}`.
 
 Verification rules (spec §6): (v1) shipment exists and status in BOOKED; (v2) its truck exists; (v3) truck availability flag is 0 exactly while ≥1 BOOKED shipment for it exists (no double-book: >1 BOOKED per truck = violation); (v4) cost ≥ 0.
@@ -767,12 +790,13 @@ Verification rules (spec §6): (v1) shipment exists and status in BOOKED; (v2) i
 ```python
 import db
 import mcp_server
+import seed
 
 
 def seeded(tmp_path):
     path = str(tmp_path / "logi.db")
     db.init_db(path)
-    db.seed(path)
+    seed.seed(path)
     return path
 
 
@@ -788,17 +812,12 @@ def test_verify_clean_booking(tmp_path):
 
 def test_verify_detects_double_book(tmp_path):
     path = seeded(tmp_path)
-    conn = db.get_conn(path)
-    conn.execute(
-        "INSERT INTO shipments (truck_id, origin, destination, status, cost)"
-        " VALUES ('T1','Chennai Port','Guindy','BOOKED',100)"
-    )
-    conn.execute(
-        "INSERT INTO shipments (truck_id, origin, destination, status, cost)"
-        " VALUES ('T1','Chennai Port','Guindy','BOOKED',150)"
-    )
-    conn.commit()
-    conn.close()
+    with db.get_session(path) as s:
+        s.add(db.Shipment(truck_id="T1", origin="Chennai Port",
+                          destination="Guindy", status="BOOKED", cost=100))
+        s.add(db.Shipment(truck_id="T1", origin="Chennai Port",
+                          destination="Guindy", status="BOOKED", cost=150))
+        s.commit()
     res = mcp_server.verify_booking_impl(1, db_path=path)
     assert res["status"] == "ERROR"
     assert res["reason"] == "verifier_violations"
@@ -814,20 +833,17 @@ def test_verify_unknown_shipment(tmp_path):
 
 def test_verify_flags_negative_cost(tmp_path):
     path = seeded(tmp_path)
-    conn = db.get_conn(path)
-    conn.execute(
-        "INSERT INTO shipments (truck_id, origin, destination, status, cost)"
-        " VALUES ('T1','A','B','BOOKED',-5)"
-    )
-    conn.commit()
-    conn.close()
+    with db.get_session(path) as s:
+        s.add(db.Shipment(truck_id="T1", origin="A", destination="B",
+                          status="BOOKED", cost=-5))
+        s.commit()
     res = mcp_server.verify_booking_impl(1, db_path=path)
     assert any("negative_cost" in v for v in res["violations"])
 ```
 
 - [ ] **Step 2: Run test, expect failure**
 
-Run: `.venv/bin/pytest tests/test_verify.py -q`
+Run: `uv run pytest tests/test_verify.py -q`
 Expected: FAIL (attribute missing)
 
 - [ ] **Step 3: Add verifier impl + MCP tool to mcp_server.py**
@@ -835,43 +851,43 @@ Expected: FAIL (attribute missing)
 ```python
 def verify_booking_impl(shipment_id: int, db_path: str = "") -> dict:
     try:
-        conn = _conn(db_path)
-        ship = conn.execute(
-            "SELECT * FROM shipments WHERE id=?", (shipment_id,)
-        ).fetchone()
-        if ship is None:
-            conn.close()
-            return _err("not_found", f"shipment {shipment_id}")
-        violations = []
-        if ship["status"] != "BOOKED":
-            violations.append(f"bad_status:{ship['status']}")
-        if ship["cost"] is None or ship["cost"] < 0:
-            violations.append(f"negative_cost:{ship['cost']}")
-        truck = conn.execute(
-            "SELECT * FROM trucks WHERE id=?", (ship["truck_id"],)
-        ).fetchone()
-        if truck is None:
-            violations.append(f"missing_truck:{ship['truck_id']}")
-        else:
-            booked = conn.execute(
-                "SELECT COUNT(*) c FROM shipments"
-                " WHERE truck_id=? AND status='BOOKED' AND id != ?",
-                (ship["truck_id"], shipment_id),
-            ).fetchone()["c"]
-            if booked > 0:
-                violations.append(
-                    f"double_book:truck {ship['truck_id']} has {booked} other BOOKED shipments"
+        with db.get_session(db_path) as s:
+            ship = s.get(db.Shipment, shipment_id)
+            if ship is None:
+                return _err("not_found", f"shipment {shipment_id}")
+            violations = []
+            if ship.status != "BOOKED":
+                violations.append(f"bad_status:{ship.status}")
+            if ship.cost is None or ship.cost < 0:
+                violations.append(f"negative_cost:{ship.cost}")
+            truck = s.get(db.Truck, ship.truck_id)
+            if truck is None:
+                violations.append(f"missing_truck:{ship.truck_id}")
+            else:
+                booked = (
+                    s.query(db.Shipment)
+                    .filter(db.Shipment.truck_id == ship.truck_id,
+                            db.Shipment.status == "BOOKED",
+                            db.Shipment.id != shipment_id)
+                    .count()
                 )
-            if booked == 0 and truck["available"] != 0:
-                violations.append(f"truck_flag:truck {ship['truck_id']} still available")
-        conn.close()
-        if violations:
-            return {
-                "status": "ERROR", "reason": "verifier_violations",
-                "detail": "; ".join(violations), "violations": violations,
-            }
-        return {"status": "OK", "violations": violations}
-    except sqlite3.OperationalError as exc:
+                if booked > 0:
+                    violations.append(
+                        f"double_book:truck {ship.truck_id} has"
+                        f" {booked} other BOOKED shipments"
+                    )
+                if booked == 0 and not truck.available:
+                    violations.append(
+                        f"truck_flag:truck {ship.truck_id} marked unavailable"
+                        " with no BOOKED shipments"
+                    )
+            if violations:
+                return {
+                    "status": "ERROR", "reason": "verifier_violations",
+                    "detail": "; ".join(violations), "violations": violations,
+                }
+            return {"status": "OK", "violations": violations}
+    except OperationalError as exc:
         if "locked" in str(exc) and _DB_LOCK_RETRIES:
             time.sleep(config.RETRY_DELAY_S)
             return verify_booking_impl(shipment_id, db_path)
@@ -886,7 +902,7 @@ def verify_booking(shipment_id: int) -> dict:
 
 - [ ] **Step 4: Run all tests**
 
-Run: `.venv/bin/pytest tests/ -q`
+Run: `uv run pytest tests/ -q`
 Expected: all green
 
 - [ ] **Step 5: Commit**
@@ -943,7 +959,7 @@ def test_verifier_instruction_has_ladder():
 
 - [ ] **Step 2: Run test, expect failure**
 
-Run: `.venv/bin/pytest tests/test_agents.py -q`
+Run: `uv run pytest tests/test_agents.py -q`
 Expected: FAIL (`No module named 'logistics'`)
 
 - [ ] **Step 3: Write sub-agents**
@@ -1007,12 +1023,12 @@ from . import freight, verifier, warehouse
 
 - [ ] **Step 4: Run test, expect pass**
 
-Run: `.venv/bin/pytest tests/test_agents.py -q`
+Run: `uv run pytest tests/test_agents.py -q`
 Expected: 4 passed
 
 - [ ] **Step 5: Run full suite + commit**
 
-Run: `.venv/bin/pytest tests/ -q`
+Run: `uv run pytest tests/ -q`
 Expected: all green
 
 ```bash
@@ -1063,7 +1079,7 @@ def test_root_instruction_routes():
 
 - [ ] **Step 2: Run test, expect failure**
 
-Run: `.venv/bin/pytest tests/test_root_agent.py -q`
+Run: `uv run pytest tests/test_root_agent.py -q`
 Expected: FAIL
 
 - [ ] **Step 3: Write logistics/agent.py + __init__.py**
@@ -1108,13 +1124,13 @@ __all__ = ["agent", "root_agent"]
 
 - [ ] **Step 4: Run all tests, expect pass**
 
-Run: `.venv/bin/pytest tests/ -q`
+Run: `uv run pytest tests/ -q`
 Expected: all green
 
 - [ ] **Step 5: Manual smoke test in adk web**
 
 ```bash
-GOOGLE_API_KEY=<user-key> .venv/bin/adk web
+GOOGLE_API_KEY=<user-key> uv run adk web
 ```
 
 Then open http://127.0.0.1:8000, select `logistics`, send:
@@ -1159,22 +1175,22 @@ import sys
 
 import db
 import mcp_server
+import seed
 
 
 def seeded(tmp_path):
     path = str(tmp_path / "logi.db")
     db.init_db(path)
-    db.seed(path)
+    seed.seed(path)
     return path
 
 
 def test_remediation_ladder_t2_fallback(tmp_path):
     """Agent picks T2 when T1 unavailable: tool layer must allow it."""
     path = seeded(tmp_path)
-    conn = db.get_conn(path)
-    conn.execute("UPDATE trucks SET available=0 WHERE id='T1'")
-    conn.commit()
-    conn.close()
+    with db.get_session(path) as s:
+        s.get(db.Truck, "T1").available = False
+        s.commit()
     first = mcp_server.book_shipment_impl(
         truck_id="T1", origin="Chennai Port", destination="Guindy",
         pallets=10, db_path=path,
@@ -1218,7 +1234,6 @@ def test_mcp_server_boots_and_lists_tools():
     """MCP server answers initialize over stdio (integration; needs installed deps)."""
     script = """
 import asyncio, sys
-import mcp_server
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -1248,13 +1263,13 @@ asyncio.run(main())
 
 - [ ] **Step 3: Run, expect pass (fix only genuine failures)**
 
-Run: `.venv/bin/pytest tests/test_self_heal.py -v`
-Expected: 4 passed. If the subprocess test fails on import path, confirm cwd is repo root and `mcp_server.py` calls `db.init_db(config.DB_PATH)` under `__main__` (it creates logistics.db in cwd — acceptable).
+Run: `uv run pytest tests/test_self_heal.py -v`
+Expected: 4 passed. If the subprocess test fails on import path, confirm cwd is repo root and `mcp_server.py` calls `seed.seed(config.DB_PATH)` under `__main__` (it creates logistics.db in cwd — acceptable).
 
 - [ ] **Step 4: Full suite + commit**
 
 ```bash
-.venv/bin/pytest tests/ -q
+uv run pytest tests/ -q
 git add tests/conftest.py tests/test_self_heal.py
 git commit -m "test: self-heal fault injection and mcp stdio integration"
 ```
@@ -1278,7 +1293,7 @@ git commit -m "test: self-heal fault injection and mcp stdio integration"
 ```
 requirements.txt += single line: pillow
 ```
-Run: `.venv/bin/pip install -q pillow` — expected silent success.
+Run: `uv pip install pillow` — expected silent success. (`pillow` is already in requirements.txt; this makes the venv current mid-task.)
 
 - [ ] **Step 2: Write failing test tests/test_receipt.py**
 
@@ -1333,7 +1348,7 @@ def test_gemini_mocked_extraction(sample_image, monkeypatch):
 
 - [ ] **Step 3: Run test, expect failure**
 
-Run: `.venv/bin/pytest tests/test_receipt.py -q`
+Run: `uv run pytest tests/test_receipt.py -q`
 Expected: FAIL (`No module named 'receipt_reader'`)
 
 - [ ] **Step 4: Write receipt_reader.py**
@@ -1425,13 +1440,13 @@ Append to instruction:
 
 - [ ] **Step 6: Run all tests**
 
-Run: `.venv/bin/pytest tests/ -q`
+Run: `uv run pytest tests/ -q`
 Expected: all green (incl. mocked gemini test — no API key needed)
 
 - [ ] **Step 7: Live multimodal smoke (needs GOOGLE_API_KEY; skip silently if unreachable)**
 
 ```bash
-GOOGLE_API_KEY=<user-key> .venv/bin/python -c \
+GOOGLE_API_KEY=<user-key> uv run python -c \
  "import receipt_reader as r; print(r.read_receipt_impl('receipts/sample_challan.jpg'))"
 ```
 
@@ -1463,11 +1478,12 @@ git commit -m "feat: multimodal challan reader wired into freight agent"
 Must include (req.md §4.2):
 - One-paragraph pitch
 - Mermaid architecture diagram showing: user → root → freight/warehouse/verifier agents; McpToolset stdio → mcp_server.py → SQLite logistics.db; google_search on root; receipt image path → read_receipt_impl → Gemini Vision; retry ladder/self-heal log table
-- Setup: `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && cp .env.example .env` then paste AI Studio key
-- Run: `.venv/bin/adk web`, select `logistics`
+- Setup: one-time — `uv venv .venv && uv pip install -r requirements.txt && cp .env.example .env` then paste AI Studio key into `.env`. Requires [uv](https://docs.astral.sh/uv/) on PATH.
+- Seed the database: `uv run python seed.py` (idempotent; safe to re-run)
+- How to run: `uv run adk web`, select `logistics` from the dropdown, chat in the browser at http://127.0.0.1:8000
 - Demo script (the exact 3 prompts from spec §8, verbatim)
 - Self-healing explanation table (same rows as spec §6)
-- Test: `.venv/bin/pytest tests/ -q`
+- Test: `uv run pytest tests/ -q`
 - Repo layout listing
 
 Mermaid sketch (final wording implementer's choice, these IDs/edges required):
@@ -1490,8 +1506,8 @@ Run the demo prompt 1 against adk web and time it (watch UI timestamps or `time`
 - [ ] **Step 3: Final full verification**
 
 ```bash
-.venv/bin/pytest tests/ -q
-.venv/bin/adk web  # manual: run all 3 demo prompts
+uv run pytest tests/ -q
+uv run adk web  # manual: run all 3 demo prompts
 ```
 Expected: tests green, demo prompt 1/2/3 all return end-to-end answers with cost, verification, self-heal count.
 
