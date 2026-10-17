@@ -22,6 +22,9 @@ freight_toolset = McpToolset(
     tool_filter=["search_freight", "book_shipment", "cancel_shipment", "log_self_heal"],
 )
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from receipt_reader import read_receipt_impl
+
 freight_agent = LlmAgent(
     name="freight_agent",
     model=config.MODEL_NAME,
@@ -39,8 +42,8 @@ freight_agent = LlmAgent(
         " 5) If retries are exhausted, reply with status ERROR and the original reason."
         " Never raise or fabricate results; only report tool outputs."
         f" You MUST retry at most {config.MAX_RETRIES} times, then escalate."
-        " For photo challans, the user gives an image path; call read_receipt(path),"
+        " For photo challans, the user gives an image path; call read_receipt_impl(path),"
         " then proceed with the extracted pallets/weight/destination as a normal booking."
     ),
-    tools=[freight_toolset],
+    tools=[freight_toolset, read_receipt_impl],
 )
