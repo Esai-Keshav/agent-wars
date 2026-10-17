@@ -223,6 +223,57 @@ def log_self_heal(agent: str, error_reason: str, remediation: str, outcome: str)
     return log_self_heal_impl(agent, error_reason, remediation, outcome)
 
 
+def verify_booking_impl(shipment_id: int, db_path: str = "") -> dict:
+    try:
+        with db.get_session(db_path) as s:
+            ship = s.get(db.Shipment, shipment_id)
+            if ship is None:
+                return _err("not_found", f"shipment {shipment_id}")
+            violations = []
+            if ship.status != "BOOKED":
+                violations.append(f"bad_status:{ship.status}")
+            if ship.cost is None or ship.cost < 0:
+                violations.append(f"negative_cost:{ship.cost}")
+            truck = s.get(db.Truck, ship.truck_id)
+            if truck is None:
+                violations.append(f"missing_truck:{ship.truck_id}")
+            elif truck.available:
+                violations.append(
+                    f"truck_flag:truck {ship.truck_id} marked available"
+                    " for a BOOKED shipment"
+                )
+            else:
+                booked = (
+                    s.query(db.Shipment)
+                    .filter(db.Shipment.truck_id == ship.truck_id,
+                            db.Shipment.status == "BOOKED",
+                            db.Shipment.id != shipment_id)
+                    .count()
+                )
+                if booked > 0:
+                    violations.append(
+                        f"double_book:truck {ship.truck_id} has"
+                        f" {booked} other BOOKED shipments"
+                    )
+            if violations:
+                return {
+                    "status": "ERROR", "reason": "verifier_violations",
+                    "detail": "; ".join(violations), "violations": violations,
+                }
+            return {"status": "OK", "violations": violations}
+    except OperationalError as exc:
+        if "locked" in str(exc) and _DB_LOCK_RETRIES:
+            time.sleep(config.RETRY_DELAY_S)
+            return verify_booking_impl(shipment_id, db_path)
+        return _err("db_error", str(exc))
+
+
+@mcp.tool()
+def verify_booking(shipment_id: int) -> dict:
+    """Re-read the DB and confirm a booking is consistent (capacity, double-book, flags)."""
+    return verify_booking_impl(shipment_id)
+
+
 if __name__ == "__main__":
     seed.seed(config.DB_PATH)
     mcp.run()
